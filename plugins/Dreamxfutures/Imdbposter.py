@@ -1,0 +1,274 @@
+import re
+import aiohttp
+import warnings
+import logging
+from io import BytesIO
+from PIL import Image, ImageOps
+from info import DREAMXBOTZ_IMAGE_FETCH, TMDB_API_KEY
+from imdb import Cinemagoer
+
+
+logger = logging.getLogger(__name__)
+ia = Cinemagoer()
+LONG_IMDB_DESCRIPTION = False
+
+def list_to_str(lst):
+    if lst:
+        return ", ".join(map(str, lst))
+    return ""
+
+
+
+
+
+Image.MAX_IMAGE_PIXELS = None
+warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+async def fetch_image(url, size=(860, 1200)):
+    if not DREAMXBOTZ_IMAGE_FETCH:
+        logger.info("Image fetching is disabled.")
+        return None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    logger.error(f"Failed to fetch image: {response.status}")
+                    return None
+
+                data = await response.read()
+                img = Image.open(BytesIO(data)).convert("RGB")
+                # Exact standard poster canvas: scale the complete image to
+                # the requested dimensions, with no crop and no black padding.
+                img = img.resize(size, Image.LANCZOS)
+
+
+                out = BytesIO()
+                img.save(out, format="JPEG")
+                out.seek(0)
+                return out
+
+    except aiohttp.ClientError as e:
+        logger.error(f"HTTP request error in fetch_image: {e}")
+    except IOError as e:
+        logger.error(f"I/O error in fetch_image: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error in fetch_image: {e}")
+
+    return None
+
+
+async def get_movie_details(query, id=False, file=None):
+    try:
+        if not id:
+            query = query.strip().lower()
+            title = query
+            year = re.findall(r'[1-2]\d{3}$', query, re.IGNORECASE)
+            if year:
+                year = list_to_str(year[:1])
+                title = query.replace(year, "").strip()
+            elif file is not None:
+                year = re.findall(r'[1-2]\d{3}', file, re.IGNORECASE)
+                if year:
+                    year = list_to_str(year[:1])
+            else:
+                year = None
+            movieid = ia.search_movie(title.lower(), results=10)
+            if not movieid:
+                return None
+            if year:
+                filtered = list(filter(lambda k: str(k.get('year')) == str(year), movieid))
+                if not filtered:
+                    filtered = movieid
+            else:
+                filtered = movieid
+            movieid = list(filter(lambda k: k.get('kind') in ['movie', 'tv series'], filtered))
+            if not movieid:
+                movieid = filtered
+            movieid = movieid[0].movieID
+        else:
+            movieid = query
+        movie = ia.get_movie(movieid)
+        ia.update(movie, info=['main', 'vote details'])
+        if movie.get("original air date"):
+            date = movie["original air date"]
+        elif movie.get("year"):
+            date = movie.get("year")
+        else:
+            date = "N/A"
+        plot = movie.get('plot')
+        if plot and len(plot) > 0:
+            plot = plot[0]
+        else:
+            plot = movie.get('plot outline')
+        if plot and len(plot) > 800:
+            plot = plot[:800] + "..."
+        poster_url = movie.get('full-size cover url')
+        return {
+            'title': movie.get('title'),
+            'votes': movie.get('votes'),
+            "aka": list_to_str(movie.get("akas")),
+            "seasons": movie.get("number of seasons"),
+            "box_office": movie.get('box office'),
+            'localized_title': movie.get('localized title'),
+            'kind': movie.get("kind"),
+            "imdb_id": f"tt{movie.get('imdbID')}",
+            "cast": list_to_str(movie.get("cast")),
+            "runtime": list_to_str(movie.get("runtimes")),
+            "countries": list_to_str(movie.get("countries")),
+            "certificates": list_to_str(movie.get("certificates")),
+            "languages": list_to_str(movie.get("languages")),
+            "director": list_to_str(movie.get("director")),
+            "writer": list_to_str(movie.get("writer")),
+            "producer": list_to_str(movie.get("producer")),
+            "composer": list_to_str(movie.get("composer")),
+            "cinematographer": list_to_str(movie.get("cinematographer")),
+            "music_team": list_to_str(movie.get("music department")),
+            "distributors": list_to_str(movie.get("distributors")),
+            'release_date': date,
+            'year': movie.get('year'),
+            'genres': list_to_str(movie.get("genres")),
+            'poster_url': poster_url,
+            'plot': plot,
+            'rating': str(movie.get("rating", "N/A")),
+            'url': f'https://www.imdb.com/title/tt{movieid}'
+        }
+    except Exception as e:
+        logger.error(f"An error occurred in get_movie_details: {e}")
+        return None
+
+
+
+def _title_key(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+async def search_tmdb_results(query, limit=7):
+    """Return selectable TMDB movie/TV candidates for the request flow."""
+    try:
+        q = str(query or "").strip()
+        requested_year = re.search(r"\b(19|20)\d{2}\b\s*$", q)
+        year = requested_year.group(0) if requested_year else None
+        search_query = q
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.themoviedb.org/3/search/multi",
+                params={
+                    "api_key": TMDB_API_KEY,
+                    "query": search_query,
+                    "language": "en-US",
+                    "include_adult": "false",
+                },
+            ) as response:
+                data = await response.json(content_type=None)
+                if response.status != 200:
+                    logger.error("TMDB search failed [%s]: %s", response.status, data)
+                    return []
+            if not data.get("results") and year:
+                search_query = q[:requested_year.start()].strip()
+                async with session.get(
+                    "https://api.themoviedb.org/3/search/multi",
+                    params={
+                        "api_key": TMDB_API_KEY,
+                        "query": search_query,
+                        "language": "en-US",
+                        "include_adult": "false",
+                    },
+                ) as response:
+                    data = await response.json(content_type=None)
+        candidates = []
+        for item in data.get("results", []):
+            if item.get("media_type") not in ("movie", "tv"):
+                continue
+            item_year = str(item.get("release_date") or item.get("first_air_date") or "")[:4]
+            title = item.get("title") or item.get("name")
+            if not title or not item.get("id"):
+                continue
+            candidates.append({
+                "id": item["id"],
+                "title": title,
+                "year": int(item_year) if item_year.isdigit() else None,
+                "media_type": item.get("media_type"),
+                "poster_url": ("https://image.tmdb.org/t/p/w500" + item["poster_path"])
+                    if item.get("poster_path") else None,
+            })
+        if year:
+            year_matches = [item for item in candidates if str(item.get("year") or "") == year]
+            if year_matches:
+                candidates = year_matches
+        return candidates[:limit]
+    except Exception as exc:
+        logger.error("TMDB candidate search failed: %s", exc)
+        return []
+
+async def get_tmdb_details_direct(query, id=False, file=None, expected_year=None, file_hint=None):
+    """Direct TMDB v3 lookup used as a reliable fallback for poster/details cards."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            if id and str(query).startswith("tt"):
+                find_url = "https://api.themoviedb.org/3/find/" + str(query)
+                async with session.get(find_url, params={"api_key": TMDB_API_KEY, "external_source": "imdb_id"}) as response:
+                    found = await response.json()
+                item = (found.get("movie_results") or found.get("tv_results") or [None])[0]
+            elif id:
+                item = None
+                for kind in ("movie", "tv"):
+                    async with session.get(f"https://api.themoviedb.org/3/{kind}/{query}", params={"api_key": TMDB_API_KEY, "language": "en-US"}) as response:
+                        if response.status == 200:
+                            item = await response.json(); item["media_type"] = kind; break
+            else:
+                q = str(query).strip()
+                async with session.get("https://api.themoviedb.org/3/search/multi", params={"api_key": TMDB_API_KEY, "query": q, "language": "en-US", "include_adult": "false"}) as response:
+                    data = await response.json()
+                candidates = [x for x in data.get("results", []) if x.get("media_type") in ("movie", "tv")]
+                requested_title = re.sub(r"\s+(?:19|20)\d{2}\s*$", "", q, flags=re.I).strip()
+                if expected_year:
+                    year_matches = [x for x in candidates if str(x.get("release_date") or x.get("first_air_date") or "")[:4] == str(expected_year)]
+                    if year_matches:
+                        candidates = year_matches
+                exact = [x for x in candidates if _title_key(x.get("title") or x.get("name")) == _title_key(requested_title)]
+                pool = exact or [x for x in candidates if _title_key(requested_title) in _title_key(x.get("title") or x.get("name")) or _title_key(x.get("title") or x.get("name")) in _title_key(requested_title)]
+                hint = str(file_hint or q).lower()
+                language_aliases = {
+                    "ta": ("tamil", "tam"), "te": ("telugu", "tel"), "hi": ("hindi", "hin"),
+                    "ml": ("malayalam", "mal"), "kn": ("kannada", "kan"), "bn": ("bengali", "ben"),
+                    "mr": ("marathi", "mar"), "pa": ("punjabi", "pun"), "en": ("english", "eng"),
+                }
+                def candidate_score(candidate):
+                    lang = str(candidate.get("original_language") or "").lower()
+                    aliases = language_aliases.get(lang, (lang,))
+                    score = 0
+                    if any(alias and re.search(r"\b" + re.escape(alias) + r"\b", hint) for alias in aliases):
+                        score += 10
+                    if candidate.get("poster_path"):
+                        score += 1
+                    return score
+                if len(pool) == 1:
+                    item = pool[0]
+                elif pool:
+                    scored = sorted(((candidate_score(x), x) for x in pool), key=lambda pair: pair[0], reverse=True)
+                    # Never silently choose between equally plausible films.
+                    item = scored[0][1] if scored[0][0] > scored[1][0] else None
+                else:
+                    item = None
+            if not item:
+                return None
+            kind = "tv" if item.get("media_type") == "tv" or item.get("name") else "movie"
+            tmdb_id = item.get("id")
+            async with session.get(f"https://api.themoviedb.org/3/{kind}/{tmdb_id}", params={"api_key": TMDB_API_KEY, "language": "en-US", "append_to_response": "credits,external_ids"}) as response:
+                details = await response.json()
+            title = details.get("title") or details.get("name")
+            date = details.get("release_date") or details.get("first_air_date")
+            poster = details.get("poster_path")
+            credits = details.get("credits", {})
+            cast = ", ".join(x.get("name", "") for x in credits.get("cast", [])[:8])
+            crew = credits.get("crew", [])
+            director = ", ".join(x.get("name", "") for x in crew if x.get("job") == "Director")
+            return {"title": title, "year": int(date[:4]) if date and date[:4].isdigit() else None, "release_date": date, "rating": details.get("vote_average"), "votes": details.get("vote_count"), "runtime": details.get("runtime"), "plot": [details.get("overview") or ""], "poster_url": ("https://image.tmdb.org/t/p/w780" + poster) if poster else None, "genres": ", ".join(x.get("name", "") for x in details.get("genres", [])), "countries": ", ".join(x.get("name", "") for x in details.get("production_countries", [])), "languages": ", ".join(x.get("english_name", x.get("name", "")) for x in details.get("spoken_languages", [])), "tagline": details.get("tagline") or "", "cast": cast, "director": director, "imdb_id": details.get("external_ids", {}).get("imdb_id"), "tmdb_id": tmdb_id, "tmdb_url": f"https://www.themoviedb.org/{kind}/{tmdb_id}", "url": f"https://www.themoviedb.org/{kind}/{tmdb_id}"}
+    except Exception as exc:
+        logger.warning("Direct TMDB lookup failed: %s", exc)
+        return None
+
+async def get_movie_detailsx(query, id=False, file=None):
+    # TMDB is the authoritative resolver. The old Vercel proxy fallback was
+    # disabled and could turn a valid TMDB failure into a 402/plain-text error.
+    return await get_tmdb_details_direct(query, id=id, file=file)
