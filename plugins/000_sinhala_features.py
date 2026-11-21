@@ -12,7 +12,9 @@ from pyrogram import Client, filters, enums, StopPropagation, ContinuePropagatio
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from database.ia_filterdb import get_search_results
 from database.users_chats_db import db
-from info import ADMINS, REQST_CHANNEL, MOVIE_UPDATE_CHANNEL, LOG_CHANNEL, DELETE_TIME
+from info import ADMINS, REQST_CHANNEL, MOVIE_UPDATE_CHANNEL, LOG_CHANNEL, DELETE_TIME, SUPPORT_CHAT_ID, GRP_LNK
+from pymongo import ReturnDocument
+from pyrogram.errors import UserIsBlocked, MessageNotModified
 from utils import get_poster, get_posterx, get_seconds, temp
 from plugins.Dreamxfutures.Imdbposter import get_tmdb_details_direct, search_tmdb_results
 
@@ -144,6 +146,211 @@ async def pick_movie_request_addon(client, query):
         )
     return await query.message.edit_text(caption, reply_markup=InlineKeyboardMarkup(buttons))
 
+# ---------------------------------------------------------------------------
+# Duplicate-request tracking.
+# One open record per movie. The first requester creates the channel post;
+# later requesters are only counted and the same post is edited. When an admin
+# presses a status button, the record is closed and every requester is told.
+# ---------------------------------------------------------------------------
+_requests_col = db.db["movie_request_posts"]
+_REQUEST_LOCKS = {}
+_REQUEST_INVITE_LINK = None
+_REQUEST_INDEX_READY = False
+_BLOCKED_NOTE = "<small>Bʟᴏᴄᴋᴇᴅ? Uɴʙʟᴏᴄᴋ ᴛʜᴇ ʙᴏᴛ ᴛᴏ ʀᴇᴄᴇɪᴠᴇ ᴍᴇꜱꜱᴀɢᴇꜱ.</small>"
+
+
+def _request_lock(movie_key):
+    lock = _REQUEST_LOCKS.get(movie_key)
+    if lock is None:
+        lock = _REQUEST_LOCKS[movie_key] = asyncio.Lock()
+    return lock
+
+
+def _request_movie_key(card, title):
+    """Stable identity of a movie: TMDB kind+id, else IMDb id, else normalised title."""
+    m = re.search(r"themoviedb\.org/(movie|tv)/(\d+)", str(card.get("url") or ""))
+    if m:
+        return f"tmdb:{m.group(1)}:{m.group(2)}"
+    if card.get("imdb_id"):
+        return f"imdb:{card.get('imdb_id')}"
+    norm = re.sub(r"[^a-z0-9]+", "", str(title).lower()) or str(title).strip().lower()
+    return f"title:{norm}"
+
+
+def _request_post_text(title, mention, reporter_id, count):
+    # Keep the "📝 ʀᴇǫᴜᴇꜱᴛ :" prefix identical to the original request system so
+    # utils.extract_request_content() keeps returning just the movie title.
+    return ("<b>📝 ʀᴇǫᴜᴇꜱᴛ : <u>" + html.escape(str(title)) + "</u>\n\n"
+            f"📚 ʀᴇᴘᴏʀᴛᴇᴅ ʙʏ : {mention}\n"
+            f"📖 ʀᴇᴘᴏʀᴛᴇʀ ɪᴅ : {reporter_id}\n"
+            f"👥 ʀᴇǫᴜᴇꜱᴛ ᴄᴏᴜɴᴛ : {count}\n\n</b>")
+
+
+def _request_post_buttons(reporter_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("ᴠɪᴇᴡ ᴜsᴇʀ", url=f"tg://user?id={reporter_id}"),
+        InlineKeyboardButton("ꜱʜᴏᴡ ᴏᴘᴛɪᴏɴs", callback_data=f"show_option#{reporter_id}")
+    ]])
+
+
+async def _ensure_request_index():
+    global _REQUEST_INDEX_READY
+    if _REQUEST_INDEX_READY:
+        return
+    try:
+        await _requests_col.create_index([("movie_key", 1), ("closed", 1)])
+        _REQUEST_INDEX_READY = True
+    except Exception as e:
+        logging.getLogger(__name__).warning("request index not created: %s", e)
+
+
+async def _refresh_request_posts(client, record):
+    """Edit the existing request post(s) so only the count changes. Buttons are
+    re-sent exactly as they currently are on the message."""
+    text = _request_post_text(
+        record["title"], record["first_mention"],
+        record["first_user_id"], len(record.get("requesters", [])),
+    )
+    for post in record.get("posts", []):
+        chat_id, message_id = post["chat_id"], post["message_id"]
+        markup = None
+        try:
+            current = await client.get_messages(chat_id, message_id)
+            if current and not getattr(current, "empty", False):
+                markup = current.reply_markup
+        except Exception:
+            markup = None
+        if markup is None:
+            markup = _request_post_buttons(record["first_user_id"])
+        try:
+            if post.get("photo"):
+                await client.edit_message_caption(chat_id, message_id, text, reply_markup=markup)
+            else:
+                await client.edit_message_text(chat_id, message_id, text, reply_markup=markup)
+        except MessageNotModified:
+            pass
+        except Exception as e:
+            logging.getLogger(__name__).warning("request post edit failed (%s/%s): %s", chat_id, message_id, e)
+
+
+async def _request_invite_link(client):
+    global _REQUEST_INVITE_LINK
+    if _REQUEST_INVITE_LINK:
+        return _REQUEST_INVITE_LINK
+    try:
+        created = await client.create_chat_invite_link(int(REQST_CHANNEL))
+        _REQUEST_INVITE_LINK = created.invite_link
+    except Exception:
+        return None
+    return _REQUEST_INVITE_LINK
+
+
+# Same notifications the existing status buttons (pmfilter.py) send to the
+# first requester; here they are sent to every additional requester.
+_REQUEST_STATUS_MESSAGES = {
+    "unavailable": {
+        "text": "<b>Hᴇʏ {mention},</b>\n\n<u>{content}</u> Hᴀs Bᴇᴇɴ Mᴀʀᴋᴇᴅ Aᴅ ᴜɴᴀᴠᴀɪʟᴀʙʟᴇ...💔\n\n#Uɴᴀᴠᴀɪʟᴀʙʟᴇ ⚠️",
+        "blocked": "<b>Hᴇʏ {mention},</b>\n\n<u>{content}</u> Hᴀs Bᴇᴇɴ Mᴀʀᴋᴇᴅ Aᴅ ᴜɴᴀᴠᴀɪʟᴀʙʟᴇ...💔\n\n#Uɴᴀᴠᴀɪʟᴀʙʟᴇ ⚠️\n\n<b>" + _BLOCKED_NOTE + "</b>",
+        "search": False,
+    },
+    "Not_Released": {
+        "text": "<b>Hᴇʏ {mention}\n\n<code>{content}</code>, ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ ʜᴀꜱ ɴᴏᴛ ʙᴇᴇɴ ʀᴇʟᴇᴀꜱᴇᴅ ʏᴇᴛ\n\n#CᴏᴍɪɴɢSᴏᴏɴ...🕊️✌️</b>",
+        "blocked": "<u>Hᴇʏ {mention}</u>\n\n<b><code>{content}</code>, ʏᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ ʜᴀꜱ ɴᴏᴛ ʙᴇᴇɴ ʀᴇʟᴇᴀꜱᴇᴅ ʏᴇᴛ\n\n#CᴏᴍɪɴɢSᴏᴏɴ...🕊️✌️\n\n" + _BLOCKED_NOTE + "</b>",
+        "search": False,
+    },
+    "Type_Correct_Spelling": {
+        "text": "<b>Hᴇʏ {mention}\n\nWᴇ Dᴇᴄʟɪɴᴇᴅ Yᴏᴜʀ Rᴇǫᴜᴇsᴛ <code>{content}</code>, Bᴇᴄᴀᴜsᴇ Yᴏᴜʀ Sᴘᴇʟʟɪɴɢ Wᴀs Wʀᴏɴɢ 😢\n\n#Wʀᴏɴɢ_Sᴘᴇʟʟɪɴɢ 😑</b>",
+        "blocked": "<u>Hᴇʏ {mention}</u>\n\n<b><code>{content}</code>, Bᴇᴄᴀᴜsᴇ Yᴏᴜʀ Sᴘᴇʟʟɪɴɢ Wᴀs Wʀᴏɴɢ 😢\n\n#Wʀᴏɴɢ_Sᴘᴇʟʟɪɴɢ 😑\n\n" + _BLOCKED_NOTE + "</b>",
+        "search": False,
+    },
+    "Not_Available_In_The_Hindi": {
+        "text": "<b>Hᴇʏ {mention}\n\nඔබගේ <code>{content}</code> ᴍᴏᴠɪᴇ request එක දැනට ලබා ගත නොහැක. එබැවින් moderatorsට එය upload කළ නොහැක.\n\n#Hɪɴᴅɪ_ɴᴏᴛ_ᴀᴠᴀɪʟᴀʙʟᴇ ❌</b>",
+        "blocked": "<u>Hᴇʏ {mention}</u>\n\n<b><code>{content}</code> ᴍᴏᴠɪᴇ එක දැනට ලබා ගත නොහැක. එබැවින් moderatorsට එය upload කළ නොහැක.\n\n#Hɪɴᴅɪ_ɴᴏᴛ_ᴀᴠᴀɪʟᴀʙʟᴇ ❌\n\n" + _BLOCKED_NOTE + "</b>",
+        "search": False,
+    },
+    "uploaded": {
+        "text": "<b>Hᴇʏ {mention},\n\n<u>{content}</u> Yᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ ʜᴀꜱ ʙᴇᴇɴ ᴜᴘʟᴏᴀᴅᴇᴅ ʙʏ ᴏᴜʀ ᴍᴏᴅᴇʀᴀᴛᴏʀs.\nKɪɴᴅʟʏ sᴇᴀʀᴄʜ ɪɴ ᴏᴜʀ Gʀᴏᴜᴘ.</b>\n\n#Uᴘʟᴏᴀᴅᴇᴅ✅",
+        "blocked": "<u>{content}</u>\n\n<b>Hᴇʏ {mention}, Yᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ ʜᴀꜱ ʙᴇᴇɴ ᴜᴘʟᴏᴀᴅᴇᴅ ʙʏ ᴏᴜʀ ᴍᴏᴅᴇʀᴀᴛᴏʀs.\nKɪɴᴅʟʏ sᴇᴀʀᴄʜ ɪɴ ᴏᴜʀ Gʀᴏᴜᴘ.</b>\n\n#Uᴘʟᴏᴀᴅᴇᴅ✅\n\n" + _BLOCKED_NOTE,
+        "search": True,
+    },
+    "already_available": {
+        "text": "<b>Hᴇʏ {mention},\n\n<u>{content}</u> Yᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ ɪꜱ ᴀʟʀᴇᴀᴅʏ ᴀᴠᴀɪʟᴀʙʟᴇ ɪɴ ᴏᴜʀ ʙᴏᴛ'ꜱ ᴅᴀᴛᴀʙᴀꜱᴇ.\nKɪɴᴅʟʏ sᴇᴀʀᴄʜ ɪɴ ᴏᴜʀ Gʀᴏᴜᴘ.</b>\n\n#Aᴠᴀɪʟᴀʙʟᴇ 💗",
+        "blocked": "<b>Hᴇʏ {mention},\n\n<u>{content}</u> Yᴏᴜʀ ʀᴇǫᴜᴇꜱᴛ ɪꜱ ᴀʟʀᴇᴀᴅʏ ᴀᴠᴀɪʟᴀʙʟᴇ ɪɴ ᴏᴜʀ ʙᴏᴛ'ꜱ ᴅᴀᴛᴀʙᴀꜱᴇ.\nKɪɴᴅʟʏ sᴇᴀʀᴄʜ ɪɴ ᴏᴜʀ Gʀᴏᴜᴘ.</b>\n\n#Aᴠᴀɪʟᴀʙʟᴇ 💗\n" + _BLOCKED_NOTE,
+        "search": True,
+    },
+}
+
+
+@Client.on_callback_query(
+    filters.regex(r"^(unavailable|Not_Released|Type_Correct_Spelling|Not_Available_In_The_Hindi|uploaded|already_available)#\d+$"),
+    group=-1,
+)
+async def request_status_fanout_addon(client, query):
+    """Runs before the original status handlers in pmfilter.py (which still
+    handle the first requester exactly as before). It closes the request record
+    and sends the same status message to every other user who requested it."""
+    log = logging.getLogger(__name__)
+    try:
+        if query.from_user.id not in ADMINS or not query.message:
+            return
+        action, first_id = query.data.split("#", 1)
+        first_id = int(first_id)
+        record = await _requests_col.find_one({"posts": {"$elemMatch": {
+            "chat_id": query.message.chat.id, "message_id": query.message.id}}})
+        if not record:
+            return  # old request post made before tracking existed
+        async with _request_lock(record["movie_key"]):
+            record = await _requests_col.find_one({"_id": record["_id"]})
+            if not record or record.get("closed"):
+                return
+            await _requests_col.update_one(
+                {"_id": record["_id"], "closed": False},
+                {"$set": {"closed": True, "status": action,
+                          "closed_by": query.from_user.id,
+                          "closed_at": datetime.datetime.utcnow()}},
+            )
+        others = [uid for uid in record.get("requesters", []) if uid != first_id]
+        if not others:
+            return
+        spec = _REQUEST_STATUS_MESSAGES[action]
+        content = html.escape(str(record["title"]))
+        rows = []
+        invite = await _request_invite_link(client)
+        first_row = []
+        if invite:
+            first_row.append(InlineKeyboardButton("ᴊᴏɪɴ ᴄʜᴀɴɴᴇʟ", url=invite))
+        if query.message.link:
+            first_row.append(InlineKeyboardButton("ᴠɪᴇᴡ ꜱᴛᴀᴛᴜꜱ", url=f"{query.message.link}"))
+        if first_row:
+            rows.append(first_row)
+        if spec["search"] and GRP_LNK:
+            rows.append([InlineKeyboardButton("🔍 ꜱᴇᴀʀᴄʜ ʜᴇʀᴇ 🔎", url=GRP_LNK)])
+        markup = InlineKeyboardMarkup(rows) if rows else None
+        for uid in others:
+            try:
+                try:
+                    mention = (await client.get_users(uid)).mention
+                except Exception:
+                    mention = f'<a href="tg://user?id={uid}">User</a>'
+                try:
+                    await client.send_message(
+                        chat_id=uid,
+                        text=spec["text"].format(mention=mention, content=content),
+                        reply_markup=markup,
+                    )
+                except UserIsBlocked:
+                    if SUPPORT_CHAT_ID:
+                        await client.send_message(
+                            chat_id=int(SUPPORT_CHAT_ID),
+                            text=spec["blocked"].format(mention=mention, content=content),
+                            reply_markup=markup,
+                        )
+            except Exception as e:
+                log.warning("request status notify failed for %s: %s", uid, e)
+            await asyncio.sleep(0.05)
+    except Exception as e:
+        log.exception("request status fan-out failed: %s", e)
+
 @Client.on_callback_query(filters.regex(r"^sinhala_request#"), group=-1)
 async def submit_movie_request_addon(client, query):
     user_id = int(query.data.split("#", 1)[1])
@@ -164,38 +371,73 @@ async def submit_movie_request_addon(client, query):
             return await query.answer("මෙම චිත්‍රපටය දැනටමත් bot එකේ තිබේ.", show_alert=True)
     except Exception:
         pass
-    # Use the original request-system message shape so the existing
-    # show_option -> status-button callbacks continue to work.
-    text = ("<b>📝 ʀᴇǫᴜᴇsᴛ : <u>" + str(title) + "</u>\n\n"
-            f"📚 ʀᴇᴘᴏʀᴛᴇᴅ ʙʏ : {query.from_user.mention}\n"
-            f"📖 ʀᴇᴘᴏʀᴛᴇʀ ɪᴅ : {user_id}\n\n</b>")
-    buttons = [[
-        InlineKeyboardButton("ᴠɪᴇᴡ ᴜsᴇʀ", url=f"tg://user?id={user_id}"),
-        InlineKeyboardButton("ꜱʜᴏᴡ ᴏᴘᴛɪᴏɴs", callback_data=f"show_option#{user_id}")
-    ]]
-    markup = InlineKeyboardMarkup(buttons)
-    delivered = False
-    # Prefer the original request channel when configured.
-    if REQST_CHANNEL:
+    movie_key = _request_movie_key(card, title)
+    await _ensure_request_index()
+    async with _request_lock(movie_key):
+        # Someone already requested this movie and it is still open: do not
+        # post again. Block the same user, count a different one.
         try:
-            if poster:
-                await client.send_photo(REQST_CHANNEL, photo=poster, caption=text, reply_markup=markup)
-            else:
-                await client.send_message(REQST_CHANNEL, text, reply_markup=markup)
-            delivered = True
+            record = await _requests_col.find_one({"movie_key": movie_key, "closed": False})
         except Exception:
-            delivered = False
-    # Keep the original direct-admin fallback if the request channel is unavailable.
-    if not delivered:
-        for admin in ADMINS:
+            record = None
+        if record:
+            if user_id in record.get("requesters", []):
+                return await query.answer(
+                    "ඔබ දැනටමත් මෙම චිත්‍රපටය request කර ඇත. Admin ගේ පිළිතුර එනතුරු රැඳී සිටින්න.",
+                    show_alert=True,
+                )
+            updated = await _requests_col.find_one_and_update(
+                {"_id": record["_id"], "closed": False},
+                {"$addToSet": {"requesters": user_id}},
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated:
+                await _refresh_request_posts(client, updated)
+                return await query.answer("Request එක admin වෙත යැව්වා.", show_alert=True)
+        # Use the original request-system message shape so the existing
+        # show_option -> status-button callbacks continue to work.
+        text = _request_post_text(title, query.from_user.mention, user_id, 1)
+        markup = _request_post_buttons(user_id)
+        delivered = False
+        posts = []
+        # Prefer the original request channel when configured.
+        if REQST_CHANNEL:
             try:
                 if poster:
-                    await client.send_photo(admin, photo=poster, caption=text, reply_markup=markup)
+                    sent = await client.send_photo(REQST_CHANNEL, photo=poster, caption=text, reply_markup=markup)
                 else:
-                    await client.send_message(admin, text, reply_markup=markup)
+                    sent = await client.send_message(REQST_CHANNEL, text, reply_markup=markup)
+                posts.append({"chat_id": sent.chat.id, "message_id": sent.id, "photo": bool(poster)})
                 delivered = True
             except Exception:
-                pass
+                delivered = False
+        # Keep the original direct-admin fallback if the request channel is unavailable.
+        if not delivered:
+            for admin in ADMINS:
+                try:
+                    if poster:
+                        sent = await client.send_photo(admin, photo=poster, caption=text, reply_markup=markup)
+                    else:
+                        sent = await client.send_message(admin, text, reply_markup=markup)
+                    posts.append({"chat_id": sent.chat.id, "message_id": sent.id, "photo": bool(poster)})
+                    delivered = True
+                except Exception:
+                    pass
+        if delivered:
+            try:
+                await _requests_col.insert_one({
+                    "_id": uuid.uuid4().hex,
+                    "movie_key": movie_key,
+                    "title": str(title),
+                    "first_user_id": user_id,
+                    "first_mention": query.from_user.mention,
+                    "requesters": [user_id],
+                    "posts": posts,
+                    "closed": False,
+                    "created_at": datetime.datetime.utcnow(),
+                })
+            except Exception as e:
+                logging.getLogger(__name__).warning("request record not saved: %s", e)
     if delivered:
         await query.answer("Request එක admin වෙත යැව්වා.", show_alert=True)
     else:
